@@ -1,3 +1,5 @@
+extern crate euclid;
+
 use std::collections::{HashMap, HashSet};
 use std::mem;
 
@@ -81,10 +83,13 @@ struct DisplayItemKey {
     per_frame_key: usize,
 }
 
-#[derive(Debug)]
+type Rect = euclid::TypedRect<u32>;
+
+#[derive(Debug, Clone)]
 struct DisplayItem {
     frame: usize,
     per_frame_key: usize,
+    bounds: Rect,
 }
 
 impl DisplayItem {
@@ -316,36 +321,148 @@ fn merge_lists(
     merge_state.finalize()
 }
 
-struct DisplayItemGenerator {
+struct TrueDisplayList {
     counter: usize,
+    list: Vec<DisplayItem>,
+    changed_frames: HashSet<usize>,
 }
 
-impl DisplayItemGenerator {
-    fn get_one(&mut self) -> DisplayItem {
-        let item = DisplayItem {
-            frame: self.counter,
-            per_frame_key: self.counter,
-        };
-        self.counter += 1;
-        item
+impl TrueDisplayList {
+    fn new() -> TrueDisplayList {
+        TrueDisplayList {
+            counter: 0,
+            list: Vec::new(),
+            changed_frames: HashSet::new(),
+        }
     }
 
-    fn get_multiple(&mut self, n: usize) -> Vec<DisplayItem> {
-        (0..n).map(|_| self.get_one()).collect()
+    fn len(&self) -> usize {
+        self.list.len()
+    }
+
+    fn add_item(&mut self, bounds: Rect) {
+        let index = self.len();
+        self.insert_item(index, bounds);
+    }
+
+    fn insert_item(&mut self, index: usize, bounds: Rect) {
+        let frame = self.counter;
+        self.counter += 1;
+        self.list.insert(
+            index,
+            DisplayItem {
+                frame: frame,
+                per_frame_key: frame,
+                bounds,
+            },
+        );
+        self.changed_frames.insert(frame);
+    }
+
+    fn touch_item(&mut self, index: usize) {
+        let frame = self.list[index].frame;
+        self.changed_frames.insert(frame);
+    }
+
+    fn resize_item(&mut self, index: usize, new_bounds: Rect) {
+        let item = &mut self.list[index];
+        item.bounds = new_bounds;
+        self.changed_frames.insert(item.frame);
+    }
+
+    fn reorder_item(&mut self, old_index: usize, new_index: usize) {
+        let item = self.list.remove(old_index);
+        self.changed_frames.insert(item.frame);
+        self.list.insert(new_index, item);
+    }
+
+    fn delete_item(&mut self, index: usize) {
+        let item = self.list.remove(index);
+        self.changed_frames.insert(item.frame);
+        mem::drop(item);
+    }
+
+    fn produce_update(&mut self) -> (Vec<DisplayItem>, HashSet<usize>) {
+        let mut rebuild_rect = Rect::zero();
+        for item in &self.list {
+            if self.changed_frames.contains(&item.frame) {
+                rebuild_rect = rebuild_rect.union(&item.bounds);
+            }
+        }
+        let mut update_list = Vec::new();
+        for item in &self.list {
+            if item.bounds.intersects(&rebuild_rect) {
+                update_list.push(item.clone());
+            }
+        }
+        let changed_frames = mem::replace(&mut self.changed_frames, HashSet::new());
+        (update_list, changed_frames)
+    }
+}
+
+struct Renderer {
+    width: usize,
+    height: usize,
+}
+
+impl Renderer {
+    fn render_list(&self, items: &[DisplayItem]) -> Vec<Option<usize>> {
+        let mut pixels = vec![None; self.width * self.height];
+        for item in items {
+            let bounds = item.bounds;
+            for y in bounds.min_y()..bounds.max_y() {
+                for x in bounds.min_x()..bounds.max_x() {
+                    pixels[self.width * (y as usize) + (x as usize)] = Some(item.frame);
+                }
+            }
+        }
+        pixels
     }
 }
 
 fn main() {
-    let mut display_item_generator = DisplayItemGenerator { counter: 0 };
-    let merged = merge_lists(
-        RetainedDisplayList::new(),
-        display_item_generator.get_multiple(5),
-        (0..5).collect(),
+    let mut true_display_list = TrueDisplayList::new();
+    let mut retained_display_list = RetainedDisplayList::new();
+    let renderer = Renderer {
+        width: 32,
+        height: 32,
+    };
+
+    true_display_list.add_item(euclid::rect(0, 0, 4, 4));
+    true_display_list.add_item(euclid::rect(2, 2, 4, 4));
+    true_display_list.add_item(euclid::rect(4, 4, 4, 4));
+    true_display_list.add_item(euclid::rect(6, 6, 4, 4));
+    true_display_list.add_item(euclid::rect(8, 8, 4, 4));
+
+    let (update_list, changed_frames) = true_display_list.produce_update();
+    retained_display_list = merge_lists(retained_display_list, update_list, changed_frames);
+    assert_eq!(
+        renderer.render_list(&true_display_list.list),
+        renderer.render_list(&retained_display_list.items)
     );
-    let merged = merge_lists(
-        merged,
-        display_item_generator.get_multiple(4),
-        (5..9).collect(),
+
+    true_display_list.add_item(euclid::rect(14, 14, 4, 4));
+    true_display_list.add_item(euclid::rect(16, 16, 4, 4));
+    true_display_list.add_item(euclid::rect(18, 18, 4, 4));
+    true_display_list.add_item(euclid::rect(20, 20, 4, 4));
+    true_display_list.add_item(euclid::rect(22, 22, 4, 4));
+
+    let (update_list, changed_frames) = true_display_list.produce_update();
+    retained_display_list = merge_lists(retained_display_list, update_list, changed_frames);
+    assert_eq!(
+        renderer.render_list(&true_display_list.list),
+        renderer.render_list(&retained_display_list.items)
     );
-    println!("merged list: {:#?}", merged.items);
+
+    true_display_list.insert_item(5, euclid::rect(10, 10, 6, 6));
+
+    let (update_list, changed_frames) = true_display_list.produce_update();
+    println!("update: {:#?}, {:#?}", update_list, changed_frames);
+    retained_display_list = merge_lists(retained_display_list, update_list, changed_frames);
+    assert_eq!(
+        renderer.render_list(&true_display_list.list),
+        renderer.render_list(&retained_display_list.items)
+    );
+
+    println!("merged list: {:#?}", retained_display_list.items);
 }
