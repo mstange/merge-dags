@@ -97,17 +97,34 @@ impl DisplayItem {
 }
 
 #[derive(Debug)]
-enum OldNodeInfo {
-    Unused(DisplayItem),
-    BeingProcessed,
-    AddedToMergedDAG(usize), // index in merged DAG
-    Discarded(Vec<usize>),   // predecessors as indexes in merged DAG
+struct RetainedDisplayList {
+    items: Vec<DisplayItem>,
+    dag: DirectedAcyclicGraph,
+    key_lookup: HashMap<DisplayItemKey, usize>,
 }
 
-impl OldNodeInfo {
+impl RetainedDisplayList {
+    fn new() -> RetainedDisplayList {
+        RetainedDisplayList {
+            items: Vec::new(),
+            dag: DirectedAcyclicGraph::new(),
+            key_lookup: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum OldItemInfo {
+    Unused(DisplayItem),
+    BeingProcessed,
+    AddedToMergedList(usize), // index in merged list
+    Discarded(Vec<usize>),    // direct predecessors as indexes into merged list
+}
+
+impl OldItemInfo {
     fn is_used(&self) -> bool {
         match *self {
-            OldNodeInfo::Unused(_) => false,
+            OldItemInfo::Unused(_) => false,
             _ => true,
         }
     }
@@ -116,7 +133,7 @@ impl OldNodeInfo {
 #[derive(Debug)]
 struct MergeState<'a> {
     old_dag: &'a DirectedAcyclicGraph,
-    old_items: Vec<OldNodeInfo>,
+    old_items: Vec<OldItemInfo>,
     old_key_lookup: HashMap<DisplayItemKey, usize>,
     merged_dag: DirectedAcyclicGraph,
     merged_items: Vec<DisplayItem>,
@@ -125,10 +142,6 @@ struct MergeState<'a> {
 }
 
 impl<'a> MergeState<'a> {
-    pub fn key_to_index(&self, key: &DisplayItemKey) -> Option<usize> {
-        self.old_key_lookup.get(key).cloned()
-    }
-
     fn is_changed(&self, item: &DisplayItem) -> bool {
         self.changed_frames.contains(&item.frame)
     }
@@ -140,8 +153,8 @@ impl<'a> MergeState<'a> {
     ) -> usize {
         if !self.is_changed(&new_item) {
             let key = new_item.provide_key();
-            if let Some(index_in_old_dag) = self.key_to_index(&key) {
-                // This item is already present in the old DirectedAcyclicGraph.
+            if let Some(&index_in_old_dag) = self.old_key_lookup.get(&key) {
+                // This item is already present in the old list.
 
                 assert!(!self.old_items[index_in_old_dag].is_used());
                 let direct_predecessors = self.process_predecessors_of_old_node(index_in_old_dag);
@@ -150,7 +163,7 @@ impl<'a> MergeState<'a> {
                 // from previous_item_index_in_merged_list.
                 let old_item = mem::replace(
                     &mut self.old_items[index_in_old_dag],
-                    OldNodeInfo::BeingProcessed,
+                    OldItemInfo::BeingProcessed,
                 );
                 // TODO: merge old_item and new_item children
                 let index_in_merged_dag = self.add_new_node(
@@ -159,7 +172,7 @@ impl<'a> MergeState<'a> {
                     previous_item_index_in_merged_list,
                 );
                 self.old_items[index_in_old_dag] =
-                    OldNodeInfo::AddedToMergedDAG(index_in_merged_dag);
+                    OldItemInfo::AddedToMergedList(index_in_merged_dag);
                 mem::drop(old_item); // replaced by new_item
                 return index_in_merged_dag;
             }
@@ -190,18 +203,18 @@ impl<'a> MergeState<'a> {
     }
 
     fn process_old_node(&mut self, node: usize, direct_predecessors_in_merged_dag: Vec<usize>) {
-        if let OldNodeInfo::Unused(item) =
-            mem::replace(&mut self.old_items[node], OldNodeInfo::BeingProcessed)
+        if let OldItemInfo::Unused(item) =
+            mem::replace(&mut self.old_items[node], OldItemInfo::BeingProcessed)
         {
             if self.is_changed(&item) {
                 // Discard this node, but store its direct predecessors so that any
                 // paths through this node can be preserved.
-                self.old_items[node] = OldNodeInfo::Discarded(direct_predecessors_in_merged_dag);
+                self.old_items[node] = OldItemInfo::Discarded(direct_predecessors_in_merged_dag);
             } else {
                 // Adopt the node from the old DirectedAcyclicGraph into the new DirectedAcyclicGraph.
                 let new_node_index =
                     self.add_new_node(item, &direct_predecessors_in_merged_dag, None);
-                self.old_items[node] = OldNodeInfo::AddedToMergedDAG(new_node_index);
+                self.old_items[node] = OldItemInfo::AddedToMergedList(new_node_index);
             }
         } else {
             panic!("Shouldn't have used this node yet");
@@ -236,12 +249,12 @@ impl<'a> MergeState<'a> {
         let mut result = Vec::with_capacity(direct_predecessors_in_old_dag.len());
         for &direct_predecessor in direct_predecessors_in_old_dag {
             match &self.old_items[direct_predecessor] {
-                &OldNodeInfo::Unused(_) => panic!("should only encounter used predecessors"),
-                &OldNodeInfo::BeingProcessed => panic!("somebody forgot to clean up"),
-                &OldNodeInfo::Discarded(ref discarded_item_direct_predecessors) => {
+                &OldItemInfo::Unused(_) => panic!("should only encounter used predecessors"),
+                &OldItemInfo::BeingProcessed => panic!("somebody forgot to clean up"),
+                &OldItemInfo::Discarded(ref discarded_item_direct_predecessors) => {
                     result.extend(discarded_item_direct_predecessors)
                 }
-                &OldNodeInfo::AddedToMergedDAG(index_in_merged_dag) => {
+                &OldItemInfo::AddedToMergedList(index_in_merged_dag) => {
                     result.push(index_in_merged_dag)
                 }
             }
@@ -251,11 +264,7 @@ impl<'a> MergeState<'a> {
 
     fn finalize(
         mut self,
-    ) -> (
-        DirectedAcyclicGraph,
-        Vec<DisplayItem>,
-        HashMap<DisplayItemKey, usize>,
-    ) {
+    ) -> RetainedDisplayList {
         // Iterate over all the remaining unused nodes in self.old_dag and add
         // them to the merged_dag. Then return the merged_dag and consume this
         // object.
@@ -271,22 +280,10 @@ impl<'a> MergeState<'a> {
 
         // println!("state at the end of finalize: {:#?}", self);
 
-        (self.merged_dag, self.merged_items, self.merged_key_lookup)
-    }
-}
-
-struct RetainedDisplayList {
-    items: Vec<DisplayItem>,
-    dag: DirectedAcyclicGraph,
-    key_lookup: HashMap<DisplayItemKey, usize>,
-}
-
-impl RetainedDisplayList {
-    fn new() -> RetainedDisplayList {
         RetainedDisplayList {
-            items: Vec::new(),
-            dag: DirectedAcyclicGraph::new(),
-            key_lookup: HashMap::new(),
+            items: self.merged_items,
+            dag: self.merged_dag,
+            key_lookup: self.merged_key_lookup
         }
     }
 }
@@ -305,7 +302,7 @@ fn merge_lists(
     } = old_list;
     let mut merge_state = MergeState {
         old_dag: &dag,
-        old_items: items.into_iter().map(|i| OldNodeInfo::Unused(i)).collect(),
+        old_items: items.into_iter().map(|i| OldItemInfo::Unused(i)).collect(),
         old_key_lookup: key_lookup,
         merged_dag: DirectedAcyclicGraph::new(),
         merged_items: Vec::new(),
@@ -318,12 +315,7 @@ fn merge_lists(
             Some(merge_state.process_item_from_new_list(new_item, previous_item_index));
     }
 
-    let (dag, items, key_lookup) = merge_state.finalize();
-    RetainedDisplayList {
-        items,
-        dag,
-        key_lookup,
-    }
+    merge_state.finalize()
 }
 
 struct DisplayItemGenerator {
