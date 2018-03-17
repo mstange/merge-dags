@@ -294,8 +294,8 @@ fn merge_lists(
     changed_frames: HashSet<usize>,
 ) -> RetainedDisplayList {
     let RetainedDisplayList {
-        dag,
         items,
+        dag,
         key_lookup,
     } = old_list;
     let mut merge_state = MergeState {
