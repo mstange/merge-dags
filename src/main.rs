@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::slice;
-use std::iter;
+use std::mem;
 
 pub trait ProvidesKey<K>
 where
@@ -77,7 +77,7 @@ where
     /// This method will panic if it encounters a direct_predecessor index which
     /// is out of range.
     pub fn add_node(&mut self, node: V, direct_predecessors: &[usize]) -> usize {
-        let index = self.nodes.len();
+        let index = self.nodes_info.len();
         self.map.insert(node.provide_key(), index);
         self.nodes.push(node);
         self.nodes_info.push(NodeInfo {
@@ -89,7 +89,7 @@ where
     }
 
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.nodes_info.len()
     }
 
     pub fn key_to_index(&self, key: &K) -> Option<usize> {
@@ -115,7 +115,7 @@ struct DisplayItemKey {
     per_frame_key: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct DisplayItem {
     frame: usize,
     per_frame_key: usize,
@@ -131,11 +131,28 @@ impl ProvidesKey<DisplayItemKey> for DisplayItem {
 }
 
 #[derive(Debug)]
+enum OldNodeInfo {
+    Unused(DisplayItem),
+    BeingProcessed,
+    AddedToMergedDAG(usize), // index in merged DAG
+    Discarded(Vec<usize>), // predecessors as indexes in merged DAG
+}
+
+impl OldNodeInfo {
+    fn is_used(&self) -> bool {
+        match *self {
+            OldNodeInfo::Unused(_) => false,
+            _ => true
+        }
+    }
+}
+
+#[derive(Debug)]
 struct MergeState<'a> {
     old_dag: &'a DAG<DisplayItemKey, DisplayItem>,
     merged_dag: DAG<DisplayItemKey, DisplayItem>,
     changed_frames: HashSet<usize>,
-    used: Vec<bool>,
+    old_node_info: Vec<OldNodeInfo>,
     destroyed_items_direct_predecessors: Vec<Option<Vec<usize>>>,
 }
 
@@ -153,15 +170,21 @@ impl<'a> MergeState<'a> {
             if let Some(index_in_old_dag) = self.old_dag.key_to_index(&key) {
                 // This item is already present in the old DAG.
 
-                assert!(!self.used[index_in_old_dag]);
+                assert!(!self.old_node_info[index_in_old_dag].is_used());
                 let direct_predecessors = self.process_predecessors_of_old_node(index_in_old_dag);
+
                 // Add the node to self.merged_dag, possibly with a new edge
                 // from previous_item_index_in_merged_list.
-                return self.add_new_node(
+                let old_item = mem::replace(&mut self.old_node_info[index_in_old_dag], OldNodeInfo::BeingProcessed);
+                // TODO: merge old_item and new_item children
+                let index_in_merged_dag = self.add_new_node(
                     new_item,
                     &direct_predecessors,
                     previous_item_index_in_merged_list,
                 );
+                self.old_node_info[index_in_old_dag] = OldNodeInfo::AddedToMergedDAG(index_in_merged_dag);
+                mem::drop(old_item); // replaced by new_item
+                return index_in_merged_dag;
             }
         }
         self.add_new_node(new_item, &[], previous_item_index_in_merged_list)
@@ -187,49 +210,55 @@ impl<'a> MergeState<'a> {
         self.merged_dag.add_node(item, direct_predecessors)
     }
 
-    fn process_old_node(&mut self, node: usize, direct_predecessors: Vec<usize>) {
-        if self.is_changed(&self.old_dag.nodes[node]) {
-            // Discard this node, but store its direct predecessors so that any
-            // paths through this node can be preserved.
-            self.destroyed_items_direct_predecessors[node] = Some(direct_predecessors);
+    fn process_old_node(&mut self, node: usize, direct_predecessors_in_merged_dag: Vec<usize>) {
+        if let OldNodeInfo::Unused(item) = mem::replace(&mut self.old_node_info[node], OldNodeInfo::BeingProcessed) {
+            if self.is_changed(&item) {
+                // Discard this node, but store its direct predecessors so that any
+                // paths through this node can be preserved.
+                self.old_node_info[node] = OldNodeInfo::Discarded(direct_predecessors_in_merged_dag);
+            } else {
+                // Adopt the node from the old DAG into the new DAG.
+                let new_node_index = self.add_new_node(item, &direct_predecessors_in_merged_dag, None);
+                self.old_node_info[node] = OldNodeInfo::AddedToMergedDAG(new_node_index);
+            }
         } else {
-            // Adopt the node from the old DAG into the new DAG.
-            self.add_new_node(self.old_dag.nodes[node].clone(), &direct_predecessors, None);
+            panic!("Shouldn't have used this node yet");
         }
-        assert!(!self.used[node]);
-        self.used[node] = true;
     }
 
     fn process_predecessors_of_old_node(&mut self, node: usize) -> Vec<usize> {
         let direct_predecessors = self.old_dag.get_direct_predecessors(node);
         for &direct_predecessor in direct_predecessors {
-            if self.used[direct_predecessor] {
+            if self.old_node_info[direct_predecessor].is_used() {
                 // We have processed this node and all its predecessors already.
                 continue;
             }
             // Process the predecessors of direct_predecessor first.
-            let that_nodes_direct_predecessors =
+            let that_nodes_direct_predecessors_in_merged_dag =
                 self.process_predecessors_of_old_node(direct_predecessor);
 
             // Then process this node itself.
-            self.process_old_node(direct_predecessor, that_nodes_direct_predecessors);
+            self.process_old_node(direct_predecessor, that_nodes_direct_predecessors_in_merged_dag);
         }
 
-        self.resolve_direct_predecessors_across_destroyed_items(direct_predecessors)
+        self.resolve_node_indexes_old_to_merged(direct_predecessors)
     }
 
-    fn resolve_direct_predecessors_across_destroyed_items(
+    fn resolve_node_indexes_old_to_merged(
         &self,
-        direct_predecessors: &[usize],
+        direct_predecessors_in_old_dag: &[usize],
     ) -> Vec<usize> {
         let mut result = Vec::new();
-        for &direct_predecessor in direct_predecessors {
-            if let Some(destroyed_items_direct_predecessors) =
-                self.destroyed_items_direct_predecessors[direct_predecessor].as_ref()
-            {
-                result.extend(destroyed_items_direct_predecessors);
-            } else {
-                result.push(direct_predecessor);
+        for &direct_predecessor in direct_predecessors_in_old_dag {
+            match &self.old_node_info[direct_predecessor] {
+                &OldNodeInfo::Unused(_) => panic!("should only encounter used predecessors"),
+                &OldNodeInfo::BeingProcessed => panic!("somebody forgot to clean up"),
+                &OldNodeInfo::Discarded(ref discarded_item_direct_predecessors) => {
+                    result.extend(discarded_item_direct_predecessors)
+                },
+                &OldNodeInfo::AddedToMergedDAG(index_in_merged_dag) => {
+                    result.push(index_in_merged_dag)
+                }
             }
         }
         result
@@ -240,11 +269,11 @@ impl<'a> MergeState<'a> {
         // them to the merged_dag. Then return the merged_dag and consume this
         // object.
         for node in 0..self.old_dag.len() {
-            if self.used[node] {
+            if self.old_node_info[node].is_used() {
                 continue;
             }
 
-            let direct_predecessors = self.resolve_direct_predecessors_across_destroyed_items(
+            let direct_predecessors = self.resolve_node_indexes_old_to_merged(
                 self.old_dag.get_direct_predecessors(node),
             );
             self.process_old_node(node, direct_predecessors);
@@ -259,15 +288,16 @@ impl<'a> MergeState<'a> {
 /// Merge old_dag and new_list into a new merged DAG.
 /// The DAG contains paths for all known total suborderings of the true display list.
 fn merge_lists(
-    old_dag: DAG<DisplayItemKey, DisplayItem>,
+    mut old_dag: DAG<DisplayItemKey, DisplayItem>,
     new_list: Vec<DisplayItem>,
     changed_frames: HashSet<usize>
 ) -> DAG<DisplayItemKey, DisplayItem> {
+    let old_items = mem::replace(&mut old_dag.nodes, Vec::new());
     let mut merge_state = MergeState {
         old_dag: &old_dag,
         merged_dag: DAG::new(),
         changed_frames,
-        used: vec![false; old_dag.len()],
+        old_node_info: old_items.into_iter().map(|i| OldNodeInfo::Unused(i)).collect(),
         destroyed_items_direct_predecessors: vec![None; old_dag.len()],
     };
     let mut previous_item_index = None;
@@ -294,7 +324,7 @@ impl DisplayItemGenerator {
     }
 
     fn get_multiple(&mut self, n: usize) -> Vec<DisplayItem> {
-        iter::repeat(()).take(n).map(|_| self.get_one()).collect()
+       (0..n).map(|_| self.get_one()).collect()
     }
 }
 
