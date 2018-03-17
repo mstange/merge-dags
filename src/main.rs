@@ -250,7 +250,7 @@ impl<'a> MergeState<'a> {
         &self,
         direct_predecessors_in_old_dag: &[usize],
     ) -> Vec<usize> {
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(direct_predecessors_in_old_dag.len());
         for &direct_predecessor in direct_predecessors_in_old_dag {
             match &self.old_node_info[direct_predecessor] {
                 &OldNodeInfo::Unused(_) => panic!("should only encounter used predecessors"),
