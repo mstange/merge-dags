@@ -132,21 +132,17 @@ impl OldItemInfo {
 
 #[derive(Debug)]
 struct MergeState<'a> {
-    old_dag: &'a DirectedAcyclicGraph,
     old_items: Vec<OldItemInfo>,
+    old_dag: &'a DirectedAcyclicGraph,
     old_key_lookup: HashMap<DisplayItemKey, usize>,
-    merged_dag: DirectedAcyclicGraph,
     merged_items: Vec<DisplayItem>,
+    merged_dag: DirectedAcyclicGraph,
     merged_key_lookup: HashMap<DisplayItemKey, usize>,
     changed_frames: HashSet<usize>,
 }
 
 impl<'a> MergeState<'a> {
-    fn is_changed(&self, item: &DisplayItem) -> bool {
-        self.changed_frames.contains(&item.frame)
-    }
-
-    fn process_item_from_new_list(
+    pub fn process_item_from_new_list(
         &mut self,
         new_item: DisplayItem,
         previous_item_index_in_merged_list: Option<usize>,
@@ -178,6 +174,33 @@ impl<'a> MergeState<'a> {
             }
         }
         self.add_new_node(new_item, &[], previous_item_index_in_merged_list)
+    }
+
+    pub fn finalize(mut self) -> RetainedDisplayList {
+        // Iterate over all the remaining unused nodes in self.old_dag and add
+        // them to the merged_dag. Then return the merged_dag and consume this
+        // object.
+        for node in 0..self.old_dag.len() {
+            if self.old_items[node].is_used() {
+                continue;
+            }
+
+            let direct_predecessors =
+                self.resolve_node_indexes_old_to_merged(self.old_dag.get_direct_predecessors(node));
+            self.process_old_node(node, direct_predecessors);
+        }
+
+        // println!("state at the end of finalize: {:#?}", self);
+
+        RetainedDisplayList {
+            items: self.merged_items,
+            dag: self.merged_dag,
+            key_lookup: self.merged_key_lookup,
+        }
+    }
+
+    fn is_changed(&self, item: &DisplayItem) -> bool {
+        self.changed_frames.contains(&item.frame)
     }
 
     /// Adds a new node and returns its index.
@@ -261,31 +284,6 @@ impl<'a> MergeState<'a> {
         }
         result
     }
-
-    fn finalize(
-        mut self,
-    ) -> RetainedDisplayList {
-        // Iterate over all the remaining unused nodes in self.old_dag and add
-        // them to the merged_dag. Then return the merged_dag and consume this
-        // object.
-        for node in 0..self.old_dag.len() {
-            if self.old_items[node].is_used() {
-                continue;
-            }
-
-            let direct_predecessors =
-                self.resolve_node_indexes_old_to_merged(self.old_dag.get_direct_predecessors(node));
-            self.process_old_node(node, direct_predecessors);
-        }
-
-        // println!("state at the end of finalize: {:#?}", self);
-
-        RetainedDisplayList {
-            items: self.merged_items,
-            dag: self.merged_dag,
-            key_lookup: self.merged_key_lookup
-        }
-    }
 }
 
 /// Merge old_list and new_list into a new merged RetainedDisplayList.
@@ -301,11 +299,11 @@ fn merge_lists(
         key_lookup,
     } = old_list;
     let mut merge_state = MergeState {
-        old_dag: &dag,
         old_items: items.into_iter().map(|i| OldItemInfo::Unused(i)).collect(),
+        old_dag: &dag,
         old_key_lookup: key_lookup,
-        merged_dag: DirectedAcyclicGraph::new(),
         merged_items: Vec::new(),
+        merged_dag: DirectedAcyclicGraph::new(),
         merged_key_lookup: HashMap::new(),
         changed_frames,
     };
