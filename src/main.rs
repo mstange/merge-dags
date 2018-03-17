@@ -84,6 +84,9 @@ where
             index_in_direct_predecessor_list: self.direct_predecessor_list.len(),
             direct_predecessor_count: direct_predecessors.len(),
         });
+        for &direct_predecessor in direct_predecessors {
+            assert!(direct_predecessor < index);
+        }
         self.direct_predecessor_list.extend(direct_predecessors);
         index
     }
@@ -153,7 +156,6 @@ struct MergeState<'a> {
     merged_dag: DAG<DisplayItemKey, DisplayItem>,
     changed_frames: HashSet<usize>,
     old_node_info: Vec<OldNodeInfo>,
-    destroyed_items_direct_predecessors: Vec<Option<Vec<usize>>>,
 }
 
 impl<'a> MergeState<'a> {
@@ -298,7 +300,6 @@ fn merge_lists(
         merged_dag: DAG::new(),
         changed_frames,
         old_node_info: old_items.into_iter().map(|i| OldNodeInfo::Unused(i)).collect(),
-        destroyed_items_direct_predecessors: vec![None; old_dag.len()],
     };
     let mut previous_item_index = None;
     for new_item in new_list.into_iter() {
