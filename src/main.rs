@@ -1,7 +1,10 @@
+extern crate afl;
 extern crate euclid;
+extern crate num;
 
 use std::collections::{HashMap, HashSet};
 use std::mem;
+use num::clamp;
 
 #[derive(Debug)]
 struct NodeInfo {
@@ -78,15 +81,15 @@ impl DirectedAcyclicGraph {
 }
 
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
-struct DisplayItemKey {
+pub struct DisplayItemKey {
     frame: usize,
     per_frame_key: usize,
 }
 
-type Rect = euclid::TypedRect<u32>;
+pub type Rect = euclid::TypedRect<u32>;
 
 #[derive(Debug, Clone)]
-struct DisplayItem {
+pub struct DisplayItem {
     frame: usize,
     per_frame_key: usize,
     bounds: Rect,
@@ -102,14 +105,14 @@ impl DisplayItem {
 }
 
 #[derive(Debug)]
-struct RetainedDisplayList {
+pub struct RetainedDisplayList {
     items: Vec<DisplayItem>,
     dag: DirectedAcyclicGraph,
     key_lookup: HashMap<DisplayItemKey, usize>,
 }
 
 impl RetainedDisplayList {
-    fn new() -> RetainedDisplayList {
+    pub fn new() -> RetainedDisplayList {
         RetainedDisplayList {
             items: Vec::new(),
             dag: DirectedAcyclicGraph::new(),
@@ -321,14 +324,14 @@ fn merge_lists(
     merge_state.finalize()
 }
 
-struct TrueDisplayList {
+pub struct TrueDisplayList {
     counter: usize,
     list: Vec<DisplayItem>,
     changed_frames: HashSet<usize>,
 }
 
 impl TrueDisplayList {
-    fn new() -> TrueDisplayList {
+    pub fn new() -> TrueDisplayList {
         TrueDisplayList {
             counter: 0,
             list: Vec::new(),
@@ -336,16 +339,16 @@ impl TrueDisplayList {
         }
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.list.len()
     }
 
-    fn add_item(&mut self, bounds: Rect) {
+    pub fn add_item(&mut self, bounds: Rect) {
         let index = self.len();
         self.insert_item(index, bounds);
     }
 
-    fn insert_item(&mut self, index: usize, bounds: Rect) {
+    pub fn insert_item(&mut self, index: usize, bounds: Rect) {
         let frame = self.counter;
         self.counter += 1;
         self.list.insert(
@@ -359,30 +362,30 @@ impl TrueDisplayList {
         self.changed_frames.insert(frame);
     }
 
-    fn touch_item(&mut self, index: usize) {
+    pub fn touch_item(&mut self, index: usize) {
         let frame = self.list[index].frame;
         self.changed_frames.insert(frame);
     }
 
-    fn resize_item(&mut self, index: usize, new_bounds: Rect) {
+    pub fn resize_item(&mut self, index: usize, new_bounds: Rect) {
         let item = &mut self.list[index];
         item.bounds = new_bounds;
         self.changed_frames.insert(item.frame);
     }
 
-    fn reorder_item(&mut self, old_index: usize, new_index: usize) {
+    pub fn reorder_item(&mut self, old_index: usize, new_index: usize) {
         let item = self.list.remove(old_index);
         self.changed_frames.insert(item.frame);
         self.list.insert(new_index, item);
     }
 
-    fn delete_item(&mut self, index: usize) {
+    pub fn delete_item(&mut self, index: usize) {
         let item = self.list.remove(index);
         self.changed_frames.insert(item.frame);
         mem::drop(item);
     }
 
-    fn produce_update(&mut self) -> (Vec<DisplayItem>, HashSet<usize>) {
+    pub fn produce_update(&mut self) -> (Vec<DisplayItem>, HashSet<usize>) {
         let mut rebuild_rect = Rect::zero();
         for item in &self.list {
             if self.changed_frames.contains(&item.frame) {
@@ -420,49 +423,160 @@ impl Renderer {
     }
 }
 
-fn main() {
+struct U8Yielder<'a> {
+    s: &'a [u8],
+}
+
+impl<'a> U8Yielder<'a> {
+    fn next(&mut self) -> Option<u8> {
+        if self.s.is_empty() {
+            return None;
+        }
+        let b = self.s[0];
+        self.s = &self.s[1..];
+        Some(b)
+    }
+}
+
+fn run_test_stream(s: &[u8], width: u8, height: u8) -> Option<()> {
     let mut true_display_list = TrueDisplayList::new();
     let mut retained_display_list = RetainedDisplayList::new();
     let renderer = Renderer {
-        width: 32,
-        height: 32,
+        width: width as usize,
+        height: height as usize,
     };
+    let mut s = U8Yielder { s };
+    loop {
+        match s.next()? {
+            1 => {
+                // insert item
+                // println!("insert");
+                let index = clamp(s.next()? as usize, 0, true_display_list.len());
+                let x = clamp(s.next()?, 0, width - 1);
+                let y = clamp(s.next()?, 0, height - 1);
+                let w = clamp(s.next()?, 1, width - x);
+                let h = clamp(s.next()?, 1, height - y);
+                true_display_list
+                    .insert_item(index, euclid::rect(x as u32, y as u32, w as u32, h as u32));
+            }
+            2 => {
+                // touch item
+                if true_display_list.len() != 0 {
+                    // println!("touch");
+                    let index = clamp(s.next()? as usize, 0, true_display_list.len() - 1);
+                    true_display_list.touch_item(index);
+                }
+            }
+            3 => {
+                // reorder item
+                if true_display_list.len() != 0 {
+                    // println!("reorder");
+                    let old_index = clamp(s.next()? as usize, 0, true_display_list.len() - 1);
+                    let new_index = clamp(s.next()? as usize, 0, true_display_list.len() - 1);
+                    if old_index != new_index {
+                        true_display_list.reorder_item(old_index, new_index);
+                    }
+                }
+            }
+            4 => {
+                // resize item
+                if true_display_list.len() != 0 {
+                    // println!("resize");
+                    let index = clamp(s.next()? as usize, 0, true_display_list.len() - 1);
+                    let x = clamp(s.next()?, 0, width - 1);
+                    let y = clamp(s.next()?, 0, height - 1);
+                    let w = clamp(s.next()?, 1, width - x);
+                    let h = clamp(s.next()?, 1, height - y);
+                    true_display_list
+                        .resize_item(index, euclid::rect(x as u32, y as u32, w as u32, h as u32));
+                }
+            }
+            5 => {
+                // delete item
+                if true_display_list.len() != 0 {
+                    // println!("delete");
+                    let index = clamp(s.next()? as usize, 0, true_display_list.len() - 1);
+                    true_display_list.delete_item(index);
+                }
+            }
+            _ => {
+                // check consistency
+                if !true_display_list.changed_frames.is_empty() {
+                    let (update_list, changed_frames) = true_display_list.produce_update();
+                    // println!("update: {:#?}, {:#?}", update_list, changed_frames);
+                    retained_display_list =
+                        merge_lists(retained_display_list, update_list, changed_frames);
+                    assert_eq!(
+                        renderer.render_list(&true_display_list.list),
+                        renderer.render_list(&retained_display_list.items)
+                    );
 
-    true_display_list.add_item(euclid::rect(0, 0, 4, 4));
-    true_display_list.add_item(euclid::rect(2, 2, 4, 4));
-    true_display_list.add_item(euclid::rect(4, 4, 4, 4));
-    true_display_list.add_item(euclid::rect(6, 6, 4, 4));
-    true_display_list.add_item(euclid::rect(8, 8, 4, 4));
+                    // println!("merged list: {:#?}", retained_display_list.items);
+                }
+            }
+        }
+    }
+}
 
-    let (update_list, changed_frames) = true_display_list.produce_update();
-    retained_display_list = merge_lists(retained_display_list, update_list, changed_frames);
-    assert_eq!(
-        renderer.render_list(&true_display_list.list),
-        renderer.render_list(&retained_display_list.items)
-    );
+fn main() {
+    afl::read_stdio_bytes(|bytes| {
+        run_test_stream(&bytes, 32, 32);
+    });
+}
 
-    true_display_list.add_item(euclid::rect(14, 14, 4, 4));
-    true_display_list.add_item(euclid::rect(16, 16, 4, 4));
-    true_display_list.add_item(euclid::rect(18, 18, 4, 4));
-    true_display_list.add_item(euclid::rect(20, 20, 4, 4));
-    true_display_list.add_item(euclid::rect(22, 22, 4, 4));
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn insert_between_pancakes() {
+        use TrueDisplayList;
+        use RetainedDisplayList;
+        use Renderer;
+        use euclid;
+        use merge_lists;
 
-    let (update_list, changed_frames) = true_display_list.produce_update();
-    retained_display_list = merge_lists(retained_display_list, update_list, changed_frames);
-    assert_eq!(
-        renderer.render_list(&true_display_list.list),
-        renderer.render_list(&retained_display_list.items)
-    );
+        let mut true_display_list = TrueDisplayList::new();
+        let mut retained_display_list = RetainedDisplayList::new();
+        let renderer = Renderer {
+            width: 32,
+            height: 32,
+        };
 
-    true_display_list.insert_item(5, euclid::rect(10, 10, 6, 6));
+        true_display_list.add_item(euclid::rect(0, 0, 4, 4));
+        true_display_list.add_item(euclid::rect(2, 2, 4, 4));
+        true_display_list.add_item(euclid::rect(4, 4, 4, 4));
+        true_display_list.add_item(euclid::rect(6, 6, 4, 4));
+        true_display_list.add_item(euclid::rect(8, 8, 4, 4));
 
-    let (update_list, changed_frames) = true_display_list.produce_update();
-    println!("update: {:#?}, {:#?}", update_list, changed_frames);
-    retained_display_list = merge_lists(retained_display_list, update_list, changed_frames);
-    assert_eq!(
-        renderer.render_list(&true_display_list.list),
-        renderer.render_list(&retained_display_list.items)
-    );
+        let (update_list, changed_frames) = true_display_list.produce_update();
+        retained_display_list = merge_lists(retained_display_list, update_list, changed_frames);
+        assert_eq!(
+            renderer.render_list(&true_display_list.list),
+            renderer.render_list(&retained_display_list.items)
+        );
 
-    println!("merged list: {:#?}", retained_display_list.items);
+        true_display_list.add_item(euclid::rect(14, 14, 4, 4));
+        true_display_list.add_item(euclid::rect(16, 16, 4, 4));
+        true_display_list.add_item(euclid::rect(18, 18, 4, 4));
+        true_display_list.add_item(euclid::rect(20, 20, 4, 4));
+        true_display_list.add_item(euclid::rect(22, 22, 4, 4));
+
+        let (update_list, changed_frames) = true_display_list.produce_update();
+        retained_display_list = merge_lists(retained_display_list, update_list, changed_frames);
+        assert_eq!(
+            renderer.render_list(&true_display_list.list),
+            renderer.render_list(&retained_display_list.items)
+        );
+
+        true_display_list.insert_item(5, euclid::rect(10, 10, 6, 6));
+
+        let (update_list, changed_frames) = true_display_list.produce_update();
+        println!("update: {:#?}, {:#?}", update_list, changed_frames);
+        retained_display_list = merge_lists(retained_display_list, update_list, changed_frames);
+        assert_eq!(
+            renderer.render_list(&true_display_list.list),
+            renderer.render_list(&retained_display_list.items)
+        );
+
+        println!("merged list: {:#?}", retained_display_list.items);
+    }
 }

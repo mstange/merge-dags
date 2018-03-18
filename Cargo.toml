@@ -4,4 +4,6 @@ name = "merge-dags"
 version = "0.1.0"
 
 [dependencies]
+afl = "0.3.2"
 euclid = "0.17.2"
+num = "0.1.42"
