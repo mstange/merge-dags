@@ -450,14 +450,17 @@ fn run_test_stream(s: &[u8], width: u8, height: u8) -> Option<()> {
         match s.next()? {
             1 => {
                 // insert item
-                // println!("insert");
-                let index = clamp(s.next()? as usize, 0, true_display_list.len());
-                let x = clamp(s.next()?, 0, width - 1);
-                let y = clamp(s.next()?, 0, height - 1);
-                let w = clamp(s.next()?, 1, width - x);
-                let h = clamp(s.next()?, 1, height - y);
-                true_display_list
-                    .insert_item(index, euclid::rect(x as u32, y as u32, w as u32, h as u32));
+                if true_display_list.len() < 256 {
+                    // shouldn't need more than 255 items to hit interesting cases
+                    // println!("insert");
+                    let index = clamp(s.next()? as usize, 0, true_display_list.len());
+                    let x = clamp(s.next()?, 0, width - 1);
+                    let y = clamp(s.next()?, 0, height - 1);
+                    let w = clamp(s.next()?, 1, width - x);
+                    let h = clamp(s.next()?, 1, height - y);
+                    true_display_list
+                        .insert_item(index, euclid::rect(x as u32, y as u32, w as u32, h as u32));
+                }
             }
             2 => {
                 // touch item
