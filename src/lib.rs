@@ -295,7 +295,7 @@ impl<'a> MergeState<'a> {
 
 /// Merge old_list and new_list into a new merged RetainedDisplayList.
 /// The DAG contains paths for all known total suborderings of the true display list.
-fn merge_lists(
+pub fn merge_lists(
     old_list: RetainedDisplayList,
     new_list: Vec<DisplayItem>,
     changed_frames: HashSet<usize>,
@@ -321,6 +321,93 @@ fn merge_lists(
     }
 
     merge_state.finalize()
+}
+
+/// This is the pre-bug 1439809 implementation, or at least something close to it.
+pub fn merge_lists_badly(
+    old_list: RetainedDisplayList,
+    new_list: Vec<DisplayItem>,
+    changed_frames: HashSet<usize>,
+) -> RetainedDisplayList {
+    let RetainedDisplayList {
+        dag,
+        items,
+        key_lookup,
+    } = old_list;
+    let mut old_items: Vec<OldItemInfo> =
+        items.into_iter().map(|i| OldItemInfo::Unused(i)).collect();
+    let new_list_keys: HashSet<_> = new_list.iter().map(|i| i.provide_key()).collect();
+    let mut merged_list = Vec::new();
+    let mut merged_key_lookup = HashMap::new();
+    let mut i: usize = 0;
+
+    for new_item in new_list.into_iter() {
+        let key = new_item.provide_key();
+        if let Some(index_in_old_list) = key_lookup.get(&key).cloned() {
+            // println!(
+            //     "found old item for new_item {:?} at index {}",
+            //     new_item, index_in_old_list
+            // );
+            while i < index_in_old_list {
+                if let OldItemInfo::Unused(old_item) =
+                    mem::replace(&mut old_items[i], OldItemInfo::BeingProcessed)
+                {
+                    // println!("old_item: {:?}", old_item);
+                    let key = old_item.provide_key();
+                    if new_list_keys.contains(&key) {
+                        old_items[i] = OldItemInfo::Unused(old_item);
+                        break;
+                    }
+                    if changed_frames.contains(&old_item.frame) {
+                        mem::drop(old_item);
+                        old_items[i] = OldItemInfo::Discarded(vec![]);
+                    } else {
+                        let index = merged_list.len();
+                        merged_list.push(old_item);
+                        old_items[i] = OldItemInfo::AddedToMergedList(index);
+                        merged_key_lookup.insert(key.clone(), index);
+                    }
+                } else {
+                    // panic!("not sure what's going on, to be quite honest");
+                }
+                i += 1;
+            }
+            // println!("adding new_item {:?} to the merged list", new_item);
+            let index = merged_list.len();
+            merged_list.push(new_item);
+            merged_key_lookup.insert(key.clone(), index);
+
+            if let OldItemInfo::Unused(old_item) =
+                mem::replace(&mut old_items[i], OldItemInfo::BeingProcessed)
+            {
+                if old_item.provide_key() == key {
+                    mem::drop(old_item);
+                    old_items[i] = OldItemInfo::Discarded(vec![]);
+                } else {
+                    old_items[index_in_old_list] = OldItemInfo::Discarded(vec![]);
+                }
+            } else {
+                old_items[index_in_old_list] = OldItemInfo::Discarded(vec![]);
+            }
+        } else {
+            let index = merged_list.len();
+            merged_list.push(new_item);
+            merged_key_lookup.insert(key, index);
+        }
+    }
+    for old_item in old_items.iter_mut().skip(i) {
+        if let OldItemInfo::Unused(old_item) = mem::replace(old_item, OldItemInfo::BeingProcessed) {
+            let index = merged_list.len();
+            merged_key_lookup.insert(old_item.provide_key(), index);
+            merged_list.push(old_item);
+        }
+    }
+
+    RetainedDisplayList {
+        dag,
+        items: merged_list,
+        key_lookup: merged_key_lookup,
+    }
 }
 
 pub struct TrueDisplayList {
@@ -403,9 +490,9 @@ impl TrueDisplayList {
 }
 
 struct Renderer {
-    width: usize,
-    height: usize,
-    empty_canvas: Vec<Option<usize>>
+    width: u32,
+    height: u32,
+    empty_canvas: Vec<Option<usize>>,
 }
 
 impl Renderer {
@@ -413,9 +500,9 @@ impl Renderer {
         let mut pixels = self.empty_canvas.clone();
         for item in items {
             let bounds = item.bounds;
-            for y in bounds.min_y()..bounds.max_y() {
-                for x in bounds.min_x()..bounds.max_x() {
-                    pixels[self.width * (y as usize) + (x as usize)] = Some(item.frame);
+            for y in bounds.min_y()..bounds.max_y().min(self.height) {
+                for x in bounds.min_x()..bounds.max_x().min(self.width) {
+                    pixels[self.width as usize * y as usize + x as usize] = Some(item.frame);
                 }
             }
         }
@@ -427,8 +514,8 @@ pub fn run_test_stream(s: &[u8], width: u8, height: u8) -> Option<()> {
     let mut true_display_list = TrueDisplayList::new();
     let mut retained_display_list = RetainedDisplayList::new();
     let renderer = Renderer {
-        width: width as usize,
-        height: height as usize,
+        width: width as u32,
+        height: height as u32,
         empty_canvas: vec![None; width as usize * height as usize],
     };
     let mut s = s.iter().cloned();
@@ -522,6 +609,7 @@ mod tests {
         let renderer = Renderer {
             width: 32,
             height: 32,
+            empty_canvas: vec![None; 32 * 32],
         };
 
         true_display_list.add_item(euclid::rect(0, 0, 4, 4));
@@ -553,13 +641,14 @@ mod tests {
         true_display_list.insert_item(5, euclid::rect(10, 10, 6, 6));
 
         let (update_list, changed_frames) = true_display_list.produce_update();
-        println!("update: {:#?}, {:#?}", update_list, changed_frames);
+        println!("old_list: {:#?}", retained_display_list.items);
+        println!("update: {:#?}", update_list);
+        println!("changed_frames: {:?}", changed_frames);
         retained_display_list = merge_lists(retained_display_list, update_list, changed_frames);
+        println!("merged list: {:#?}", retained_display_list.items);
         assert_eq!(
             renderer.render_list(&true_display_list.list),
             renderer.render_list(&retained_display_list.items)
         );
-
-        println!("merged list: {:#?}", retained_display_list.items);
     }
 }
