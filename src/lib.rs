@@ -1,4 +1,3 @@
-extern crate afl;
 extern crate euclid;
 extern crate num;
 
@@ -406,11 +405,12 @@ impl TrueDisplayList {
 struct Renderer {
     width: usize,
     height: usize,
+    empty_canvas: Vec<Option<usize>>
 }
 
 impl Renderer {
     fn render_list(&self, items: &[DisplayItem]) -> Vec<Option<usize>> {
-        let mut pixels = vec![None; self.width * self.height];
+        let mut pixels = self.empty_canvas.clone();
         for item in items {
             let bounds = item.bounds;
             for y in bounds.min_y()..bounds.max_y() {
@@ -423,29 +423,15 @@ impl Renderer {
     }
 }
 
-struct U8Yielder<'a> {
-    s: &'a [u8],
-}
-
-impl<'a> U8Yielder<'a> {
-    fn next(&mut self) -> Option<u8> {
-        if self.s.is_empty() {
-            return None;
-        }
-        let b = self.s[0];
-        self.s = &self.s[1..];
-        Some(b)
-    }
-}
-
-fn run_test_stream(s: &[u8], width: u8, height: u8) -> Option<()> {
+pub fn run_test_stream(s: &[u8], width: u8, height: u8) -> Option<()> {
     let mut true_display_list = TrueDisplayList::new();
     let mut retained_display_list = RetainedDisplayList::new();
     let renderer = Renderer {
         width: width as usize,
         height: height as usize,
+        empty_canvas: vec![None; width as usize * height as usize],
     };
-    let mut s = U8Yielder { s };
+    let mut s = s.iter().cloned();
     loop {
         match s.next()? {
             1 => {
@@ -519,12 +505,6 @@ fn run_test_stream(s: &[u8], width: u8, height: u8) -> Option<()> {
             }
         }
     }
-}
-
-fn main() {
-    afl::read_stdio_bytes(|bytes| {
-        run_test_stream(&bytes, 32, 32);
-    });
 }
 
 #[cfg(test)]
