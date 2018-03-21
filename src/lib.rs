@@ -414,6 +414,7 @@ pub struct TrueDisplayList {
     counter: usize,
     list: Vec<DisplayItem>,
     changed_frames: HashSet<usize>,
+    rebuild_rect: Rect,
 }
 
 impl TrueDisplayList {
@@ -422,6 +423,7 @@ impl TrueDisplayList {
             counter: 0,
             list: Vec::new(),
             changed_frames: HashSet::new(),
+            rebuild_rect: Rect::zero(),
         }
     }
 
@@ -429,9 +431,10 @@ impl TrueDisplayList {
         self.list.len()
     }
 
-    pub fn add_item(&mut self, bounds: Rect) {
+    pub fn add_item(&mut self, bounds: Rect) -> usize{
         let index = self.len();
         self.insert_item(index, bounds);
+        index
     }
 
     pub fn insert_item(&mut self, index: usize, bounds: Rect) {
@@ -467,12 +470,13 @@ impl TrueDisplayList {
 
     pub fn delete_item(&mut self, index: usize) {
         let item = self.list.remove(index);
+        self.rebuild_rect = self.rebuild_rect.union(&item.bounds);
         self.changed_frames.insert(item.frame);
         mem::drop(item);
     }
 
     pub fn produce_update(&mut self) -> (Vec<DisplayItem>, HashSet<usize>) {
-        let mut rebuild_rect = Rect::zero();
+        let mut rebuild_rect = self.rebuild_rect;
         for item in &self.list {
             if self.changed_frames.contains(&item.frame) {
                 rebuild_rect = rebuild_rect.union(&item.bounds);
@@ -485,6 +489,7 @@ impl TrueDisplayList {
             }
         }
         let changed_frames = mem::replace(&mut self.changed_frames, HashSet::new());
+        self.rebuild_rect = Rect::zero();
         (update_list, changed_frames)
     }
 }
